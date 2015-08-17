@@ -9,8 +9,14 @@ typedef struct
 {
   Message message;
   uint8_t count;
-  int timestamp;
+  unsigned long timestamp;
 } Packet;
+
+typedef struct
+{
+  uint8_t nodeID;
+  uint8_t packetID;
+} messageID;
 
 /**************************************
 CONFIGURATION PARAMETERS
@@ -54,11 +60,12 @@ bool    toggle = true;
 bool    updatesSent = false;
 time_t  start = now();
 uint8_t id = 1;
+uint8_t index = 0;
 
 volatile bool btnPressed = false;
 volatile long lastBtnPress = -1;		// timestamp last buttonpress
 
-const Message DEFAULT_MSG = {1, 0, 0, 0, 0, 0, VERSION};
+const Message DEFAULT_MSG = {GATEWAYID, 0, 0, 0, 0, 0, VERSION};
 
 /**************************************
 configure devices
@@ -80,6 +87,7 @@ static Device devices[] = {uptimeDev, txIntDev, rssiDev, verDev,
 RFM69 radio;
 
 Packet sendBuffer[10];
+messageID recvBuffer[5];
 
 /*******************************************
 put non-system read/write functions here
@@ -96,6 +104,14 @@ void writeRelay(const Message *mess){
 /*********************************************
 Setup
 *********************************************/
+
+void incIndex(){
+  if (index == 4){
+    index = 0;
+  }else{
+    index++;
+  }
+}
 
 int freeRam () {
   extern int __heap_start, *__brkval;
@@ -157,14 +173,24 @@ void loop() {
       Serial.println("INVALID PACKET");
     }else{
       Message mess = *(Message*)radio.DATA;
+      int sender = radio.SENDERID;
+      bool ack = radio.ACK_RECEIVED;
       bool match = false;
-      reply.nodeID = radio.SENDERID;
-      reply.packetID = mess.packetID;
 
-      //check if message is a acknowledgement
-      if(mess.cmd == 2){
+      Serial.print("Received packet ");
+      Serial.print(mess.packetID);
+      Serial.print(" to ");
+      Serial.print(mess.nodeID);
+      Serial.print(" from ");
+      Serial.println(sender);
+
+      reply.nodeID = NODEID;
+      reply.packetID = id++;
+
+      //check if message is an acknowledgement
+      if(ack){
         for(int i = 0; i < 10; i++){
-          if(sendBuffer[i].message.packetID == mess.packetID){
+          if(sendBuffer[i].message.packetID == mess.packetID && sendBuffer[i].message.nodeID == mess.nodeID){
             Serial.print("Ack received for ");
             Serial.println(sendBuffer[i].message.packetID);
             sendBuffer[i].message.packetID = NULL;
@@ -172,6 +198,20 @@ void loop() {
           }
         }
       }else{
+        sendAck(&mess);
+        for (int i = 0; i < 5; i++){
+          if (recvBuffer[i].nodeID == mess.nodeID && recvBuffer[i].packetID == mess.packetID){
+            Serial.println("Message already handled");
+            match = true;
+          }
+        }
+        if (match){
+          return;
+        }else{
+          incIndex();
+          recvBuffer[index].nodeID = mess.nodeID;
+          recvBuffer[index].packetID = mess.packetID;
+        }
         //check if message is for any devices registered on node
         for (int i = 0; i < sizeof(devices) / sizeof(Device); i++){
           if (mess.devID == devices[i].id){
@@ -181,17 +221,13 @@ void loop() {
             if (mess.cmd == 0){
               devices[i].write(&mess);
               #ifdef DEBUG
-              Serial.print("writing node ");
-              Serial.print(mess.nodeID);
-              Serial.print(" dev ");
+              Serial.print("writing dev ");
               Serial.println(mess.devID);
               #endif
             }
             devices[i].read(&reply);
             #ifdef DEBUG
-            Serial.print("reading node ");
-            Serial.print(reply.nodeID);
-            Serial.print(" dev ");
+            Serial.print("reading dev ");
             Serial.println(reply.devID);
             #endif
             queueMsg(&reply);
@@ -248,18 +284,35 @@ void loop() {
   //sleep();
 }
 
+void sendAck(Message * mess){
+  Serial.print("Sending ack nodeID: ");
+  Serial.print(mess->nodeID);
+  Serial.print(" packetID: ");
+  Serial.println(mess->packetID);
+  radio.sendACK(GATEWAYID, mess, sizeof(*mess));
+}
+
 void txRadio(){
   for(int i = 0; i < 10; i++){
     if(sendBuffer[i].message.packetID != 0){
-      if(sendBuffer[i].count == 4 || (sendBuffer[i].count > 0 && now() > sendBuffer[i].timestamp + 1)){
-        Serial.print("Sending message ");
-        Serial.print("  ");
+      if(sendBuffer[i].count == 4 || (sendBuffer[i].count > 0 && millis() > sendBuffer[i].timestamp + 900)){
+        Serial.print("Sending message nodeID: ");
+        Serial.print(sendBuffer[i].message.nodeID);
+        Serial.print(" devID: ");
+        Serial.print(sendBuffer[i].message.devID);
+        Serial.print(" packetID: ");
         Serial.print(sendBuffer[i].message.packetID);
-        Serial.print("  ");
-        Serial.println(sendBuffer[i].message.devID);
+        Serial.print(" cmd: ");
+        Serial.print(sendBuffer[i].message.cmd);
+        Serial.print(" int: ");
+        Serial.print(sendBuffer[i].message.intVal);
+        Serial.print(" flt: ");
+        Serial.print(sendBuffer[i].message.fltVal);
+        Serial.print(" str: ");
+        Serial.println(sendBuffer[i].message.payLoad);
         radio.send(GATEWAYID, &sendBuffer[i].message, sizeof(sendBuffer[i].message));
         sendBuffer[i].count--;
-        sendBuffer[i].timestamp = now();
+        sendBuffer[i].timestamp = millis();
       }else if(sendBuffer[i].count < 1){
         Serial.print("Dropping message ");
         Serial.println(sendBuffer[i].message.packetID);
@@ -276,9 +329,9 @@ void queueMsg(Message * mess){
     if(sendBuffer[i].message.packetID == NULL){
       sendBuffer[i].message = *mess;
       sendBuffer[i].count = 4;
-      sendBuffer[i].timestamp = now();
+      sendBuffer[i].timestamp = millis();
       Serial.print(" message ");
-      Serial.print(sendBuffer[i].message.devID);
+      Serial.print(sendBuffer[i].message.packetID);
       Serial.println(" queued...");
       return;
     }
